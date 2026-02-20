@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::env::VarError;
-use std::io::{ErrorKind, Read};
+use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 /// load/decrypt .env file recursively from current directory to root directory
@@ -199,14 +199,8 @@ fn get_public_key<P: AsRef<Path>>(env_file: P) -> Option<String> {
 fn get_public_key_from_entries(entries: &[(String, String)]) -> Option<String> {
     entries
         .iter()
-        .find(|x| x.0 == "DOTENV_PUBLIC_KEY")
-        .map(|x| {
-            x.1.split("=")
-                .nth(1)
-                .unwrap_or("")
-                .trim_matches(|c| c == '"' || c == '\'')
-                .to_string()
-        })
+        .find(|x| x.0.starts_with("DOTENV_PUBLIC_KEY"))
+        .map(|x| x.1.trim_matches(|c| c == '"' || c == '\'').to_string())
 }
 
 fn from_read_with_dotenvx<R: Read>(reader: R) -> dotenvy::Result<()> {
@@ -399,14 +393,34 @@ fn check_and_decrypt(
 /// decrypt dotenvx encrypted item with the given private key
 /// the encrypted text can be with or without the "encrypted:" prefix
 pub fn decrypt_dotenvx_item(private_key: &str, encrypted_text: &str) -> dotenvy::Result<String> {
-    let encrypted_bytes = if let Some(stripped_value) = encrypted_text.strip_prefix("encrypted:") {
-        Base64::decode_vec(stripped_value).unwrap()
-    } else {
-        Base64::decode_vec(encrypted_text).unwrap()
-    };
-    let sk = hex::decode(private_key).unwrap();
-    let decrypted_bytes = ecies::decrypt(&sk, &encrypted_bytes).unwrap();
-    Ok(String::from_utf8(decrypted_bytes).unwrap())
+    let stripped_value = encrypted_text
+        .strip_prefix("encrypted:")
+        .unwrap_or(encrypted_text);
+    let encrypted_bytes = Base64::decode_vec(stripped_value).map_err(|e| {
+        dotenvy::Error::Io(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid base64 ciphertext: {e}"),
+        ))
+    })?;
+    let sk = hex::decode(private_key).map_err(|e| {
+        dotenvy::Error::Io(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid hex private key: {e}"),
+        ))
+    })?;
+    let decrypted_bytes = ecies::decrypt(&sk, &encrypted_bytes).map_err(|e| {
+        dotenvy::Error::Io(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("Decrypt failed: {e}"),
+        ))
+    })?;
+    let plain_text = String::from_utf8(decrypted_bytes).map_err(|e| {
+        dotenvy::Error::Io(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid UTF-8 plaintext: {e}"),
+        ))
+    })?;
+    Ok(plain_text)
 }
 
 /// encrypt dotenvx item with the given public key
@@ -429,61 +443,130 @@ fn set_env_var(key: &str, env_value: String, is_override: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::io::Cursor;
+    use std::sync::Mutex;
+
+    use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_load() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let (sk, pk) = ecies::utils::generate_keypair();
+        let public_key = hex::encode(pk.serialize_compressed());
+        let private_key = hex::encode(sk.serialize());
+        let encrypted = encrypt_dotenvx_item(&public_key, "World").unwrap();
+
+        let tmp = tempdir().unwrap();
+        let old_dir = env::current_dir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+
         unsafe {
+            set_var("DOTENV_PRIVATE_KEY", private_key);
             set_var("HELLO", "Jackie");
+        }
+        std::fs::write(
+            tmp.path().join(".env"),
+            format!("DOTENV_PUBLIC_KEY={public_key}\nHELLO={encrypted}\n"),
+        )
+        .unwrap();
+
+        unsafe {
+            // ensure no profile env overrides this test
+            env::remove_var("NODE_ENV");
+            env::remove_var("RUN_ENV");
+            env::remove_var("APP_ENV");
+            env::remove_var("SPRING_PROFILES_ACTIVE");
+            env::remove_var("MISE_ENV");
+            env::remove_var("STELA_ENV");
         }
         dotenv_override().unwrap();
         assert_eq!(env::var("HELLO").unwrap(), "World");
+
+        env::set_current_dir(old_dir).unwrap();
     }
 
     #[test]
     fn test_load_global() {
-        let store = DotenvxKeyStore::load_global().unwrap();
-        println!("{:#?}", store);
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _ = DotenvxKeyStore::load_global();
     }
 
     #[test]
     fn test_ecies_decrypt() {
-        let encrypted_text = "encrypted:BNexEwjKwt87k9aEgaSng1JY6uW8OkwMYEFTwEy/xyzDrQwQSDIUEXNlcwWi6rnvR1Q60G35NO4NWwhUYAaAON1LOnvMk+tJjTQJaM8DPeX2AJ8IzoTV44FLJsbOiMa77RLrnBv7";
-        let private_key = get_private_key(&None, &None).unwrap();
-        println!("private_key: {private_key}");
-        let text = decrypt_dotenvx_item(&private_key, encrypted_text).unwrap();
-        println!("{text}");
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (sk, pk) = ecies::utils::generate_keypair();
+        let public_key = hex::encode(pk.serialize_compressed());
+        let private_key = hex::encode(sk.serialize());
+        let encrypted_text = encrypt_dotenvx_item(&public_key, "hello").unwrap();
+        let plain_text = decrypt_dotenvx_item(&private_key, &encrypted_text).unwrap();
+        assert_eq!(plain_text, "hello");
     }
 
     #[test]
     fn test_load_from_reader() {
-        let dotenv_content = fs::read_to_string(".env").unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let (sk, pk) = ecies::utils::generate_keypair();
+        let public_key = hex::encode(pk.serialize_compressed());
+        let private_key = hex::encode(sk.serialize());
+        let encrypted = encrypt_dotenvx_item(&public_key, "World").unwrap();
+        unsafe {
+            set_var("DOTENV_PRIVATE_KEY", private_key);
+            env::remove_var("NODE_ENV");
+            env::remove_var("RUN_ENV");
+            env::remove_var("APP_ENV");
+            env::remove_var("SPRING_PROFILES_ACTIVE");
+            env::remove_var("MISE_ENV");
+            env::remove_var("STELA_ENV");
+        }
+        let dotenv_content = format!("DOTENV_PUBLIC_KEY={public_key}\nHELLO={encrypted}\n");
         let reader = Cursor::new(dotenv_content.as_bytes());
         from_read(reader).unwrap();
         assert_eq!(env::var("HELLO").unwrap(), "World");
-        // Assuming the private key is set correctly in the environment,
-        // The decryption will depend on the actual private key used
     }
     #[test]
     fn test_load_from_reader_iterator() {
-        let dotenv_content = fs::read_to_string(".env").unwrap();
-        let reader = Cursor::new(dotenv_content.as_bytes());
-        for (key, value) in from_read_iter(reader).unwrap() {
-            println!("{key}: {value}");
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let (sk, pk) = ecies::utils::generate_keypair();
+        let public_key = hex::encode(pk.serialize_compressed());
+        let private_key = hex::encode(sk.serialize());
+        let encrypted = encrypt_dotenvx_item(&public_key, "World").unwrap();
+        unsafe {
+            set_var("DOTENV_PRIVATE_KEY", private_key);
+            env::remove_var("NODE_ENV");
+            env::remove_var("RUN_ENV");
+            env::remove_var("APP_ENV");
+            env::remove_var("SPRING_PROFILES_ACTIVE");
+            env::remove_var("MISE_ENV");
+            env::remove_var("STELA_ENV");
         }
-        // Assuming the private key is set correctly in the environment
-        // The decryption will depend on the actual private key used
+        let dotenv_content = format!("DOTENV_PUBLIC_KEY={public_key}\nHELLO={encrypted}\n");
+        let reader = Cursor::new(dotenv_content.as_bytes());
+        let items = from_read_iter(reader).unwrap();
+        assert!(items.iter().any(|(k, v)| k == "HELLO" && v == "World"));
     }
 
     #[test]
     fn test_find_private_key() {
-        let public_key = "02336cf0909ec7473e6e45a46aedd998e955bfce282ade31a1fa8168a64b7f659d";
-        get_private_key(&Some(public_key.to_string()), &None).expect("Failed to get a private key");
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let (sk, pk) = ecies::utils::generate_keypair();
+        let public_key = hex::encode(pk.serialize_compressed());
+        let private_key = hex::encode(sk.serialize());
+        unsafe {
+            set_var("DOTENV_PRIVATE_KEY", private_key.clone());
+        }
+        let resolved = get_private_key(&Some(public_key), &None).unwrap();
+        assert_eq!(resolved, private_key);
     }
 
     #[test]
     fn test_keystore() {
-        DotenvxKeyStore::load_global().expect("Failed to load global keystore");
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _ = DotenvxKeyStore::load_global();
     }
 }

@@ -122,16 +122,17 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
     fn test_fetch_self_info() {
-        let key_pair = find_dotenvx_cloud_key_pair().unwrap();
+        let key_pair = find_dotenvx_cloud_key_pair().expect("dotenvx cloud keypair not configured");
         let self_info = fetch_self_info(&key_pair.private_key).unwrap();
         println!("Self info: {self_info:?}");
     }
 
     #[test]
     fn test_jwt_token() {
-        let key_pair = find_dotenvx_cloud_key_pair().unwrap();
-        let jwt_token = generate_request_token(&key_pair.private_key).unwrap();
-        println!("JWT token: {jwt_token}");
+        let kp = crate::commands::EcKeyPair::generate();
+        let jwt_token = generate_request_token(&kp.get_sk_hex()).unwrap();
+        assert!(!jwt_token.is_empty());
     }
 }

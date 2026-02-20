@@ -15,7 +15,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, ErrorKind, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use totp_rs::TOTP;
@@ -89,14 +89,30 @@ pub fn decrypt_env_item(
     private_key: &str,
     encrypted_text: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let encrypted_bytes = if encrypted_text.starts_with("encrypted:") {
-        Base64::decode_vec(encrypted_text.strip_prefix("encrypted:").unwrap()).unwrap()
-    } else {
-        Base64::decode_vec(encrypted_text).unwrap()
-    };
-    let sk = hex::decode(check_sk_hex(private_key)).unwrap();
-    let decrypted_bytes = ecies::decrypt(&sk, &encrypted_bytes).unwrap();
-    Ok(String::from_utf8(decrypted_bytes)?)
+    let stripped_value = encrypted_text
+        .strip_prefix("encrypted:")
+        .unwrap_or(encrypted_text);
+    let encrypted_bytes = Base64::decode_vec(stripped_value).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid base64 ciphertext: {e}"),
+        )
+    })?;
+    let sk = hex::decode(check_sk_hex(private_key)).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid hex private key: {e}"),
+        )
+    })?;
+    let decrypted_bytes = ecies::decrypt(&sk, &encrypted_bytes)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("Decrypt failed: {e}")))?;
+    let plain_text = String::from_utf8(decrypted_bytes).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid UTF-8 plaintext: {e}"),
+        )
+    })?;
+    Ok(plain_text)
 }
 
 pub fn decrypt_value(profile: &Option<String>, encrypted_value: &str) {
@@ -292,6 +308,7 @@ pub fn generate_totp_password(totp_url: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     use testresult::TestResult;
 
     #[test]
@@ -324,27 +341,51 @@ mod tests {
 
     #[test]
     fn test_encrypt_file() -> TestResult {
-        // Input file and password
-        let input_file = "tests/example.txt";
-        let output_file = "tests/example.txt.aes";
+        let dir = tempdir()?;
+        let input_file = dir.path().join("example.txt");
+        let output_file = dir.path().join("example.txt.aes");
         let password = "your_secure_password";
-        // Encrypt the file
-        encrypt_file(input_file, output_file, password).unwrap();
+
+        std::fs::write(&input_file, "hello")?;
+        encrypt_file(
+            input_file.to_string_lossy().as_ref(),
+            output_file.to_string_lossy().as_ref(),
+            password,
+        )
+        .unwrap();
+        assert!(output_file.exists());
         Ok(())
     }
 
     #[test]
     fn test_decrypt_file() -> TestResult {
-        // Input file and password
-        let encrypted_file = "tests/example.txt.aes";
-        let output_file = "tests/example.txt";
+        let dir = tempdir()?;
+        let input_file = dir.path().join("example.txt");
+        let encrypted_file = dir.path().join("example.txt.aes");
+        let output_file = dir.path().join("example.out.txt");
         let password = "your_secure_password";
-        // Encrypt the file
-        decrypt_file(encrypted_file, output_file, password).unwrap();
+
+        let original = "hello";
+        std::fs::write(&input_file, original)?;
+        encrypt_file(
+            input_file.to_string_lossy().as_ref(),
+            encrypted_file.to_string_lossy().as_ref(),
+            password,
+        )
+        .unwrap();
+        decrypt_file(
+            encrypted_file.to_string_lossy().as_ref(),
+            output_file.to_string_lossy().as_ref(),
+            password,
+        )
+        .unwrap();
+        let roundtrip = std::fs::read_to_string(&output_file)?;
+        assert_eq!(roundtrip, original);
         Ok(())
     }
 
     #[test]
+    #[ignore]
     fn test_https_cert() {
         let finger_print = get_https_cert_sha256("dotenvx.microservices.club", 443).unwrap();
         println!("finger_print : {}", finger_print);

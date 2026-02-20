@@ -1,22 +1,49 @@
 use std::env;
+use std::sync::Mutex;
+
+use tempfile::tempdir;
 use totp_rs::{Algorithm, Secret, TOTP};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn test_dotenv_load() {
-    // Load the .env file
-    dotenvx_rs::dotenv().ok();
-    // Check if the environment variable is set
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    let tmp = tempdir().unwrap();
+    let old_dir = env::current_dir().unwrap();
+    env::set_current_dir(tmp.path()).unwrap();
+    std::fs::write(tmp.path().join(".env"), "HELLO=World\n").unwrap();
+
+    dotenvx_rs::dotenv().unwrap();
+
     let value = env::var("HELLO").unwrap();
-    println!("HELLO={value}");
+    assert_eq!(value, "World");
+
+    unsafe {
+        env::remove_var("HELLO");
+    }
+    env::set_current_dir(old_dir).unwrap();
 }
 
 #[test]
 fn test_dotenv_load_example() {
-    // Load the .env.example file
-    dotenvx_rs::from_path(".env.example").ok();
-    // Check if the environment variable is set
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    let tmp = tempdir().unwrap();
+    let old_dir = env::current_dir().unwrap();
+    env::set_current_dir(tmp.path()).unwrap();
+    std::fs::write(tmp.path().join(".env.example"), "HELLO=World\n").unwrap();
+
+    dotenvx_rs::from_path(".env.example").unwrap();
+
     let value = env::var("HELLO").unwrap();
-    println!("HELLO={value}");
+    assert_eq!(value, "World");
+
+    unsafe {
+        env::remove_var("HELLO");
+    }
+    env::set_current_dir(old_dir).unwrap();
 }
 
 #[test]
@@ -36,6 +63,7 @@ fn test_generate_secret() {
         Secret::default().to_bytes().unwrap(),
         Some("Dotenvx".to_string()),
         "john@example.com".to_string(),
-    ).unwrap();
+    )
+    .unwrap();
     println!("{}", totp.get_url())
 }
