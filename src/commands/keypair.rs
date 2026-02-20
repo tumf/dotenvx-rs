@@ -1,8 +1,8 @@
 use crate::commands::model::KeyPair;
 use crate::commands::{
     find_all_keys, find_private_key_from_home, get_env_file_arg, get_private_key, get_private_key_name,
-    get_public_key, get_public_key_name, write_key_pair, write_private_key_to_file, write_public_key_to_file,
-    EcKeyPair, KEYS_FILE_NAME,
+    get_public_key_for_file, get_public_key_name, write_key_pair, write_private_key_to_file,
+    write_public_key_to_file, EcKeyPair, KEYS_FILE_NAME,
 };
 use clap::ArgMatches;
 use colored::Colorize;
@@ -40,7 +40,7 @@ pub fn keypair_command(command_matches: &ArgMatches, profile: &Option<String>) {
     let profile_name = get_profile_name_from_file(&env_file);
     let env_private_key_name = get_private_key_name(&profile_name);
     let env_pub_key_name = get_public_key_name(&profile_name);
-    let public_key = get_public_key(&profile_name);
+    let public_key = get_public_key_for_file(&env_file);
     let mut private_key: Option<String> = None;
     if let Ok(public_key_hex) = &public_key {
         private_key = find_private_key_from_home(public_key_hex);
