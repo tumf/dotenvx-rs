@@ -3,17 +3,14 @@ use crate::commands::model::EnvFile;
 use crate::commands::{
     adjust_env_key, escape_shell_value, get_env_file_arg, get_private_key_for_file,
     get_public_key_from_text_file, is_remote_env_file, read_content_from_dotenv_url,
-    read_dotenv_url, std_output,
+    read_dotenv_file, read_dotenv_url, std_output,
 };
 use clap::ArgMatches;
 use colored::Colorize;
 use dotenvx_rs::dotenvx::get_private_key;
 use glob::Pattern;
-use java_properties::PropertiesIter;
 use std::collections::HashMap;
 use std::fs;
-use std::fs::File;
-use std::io::BufReader;
 
 pub fn decrypt_command(command_matches: &ArgMatches, profile: &Option<String>) {
     if let Some(arg_value) = command_matches.get_one::<String>("value") {
@@ -38,7 +35,13 @@ pub fn decrypt_command(command_matches: &ArgMatches, profile: &Option<String>) {
         return;
     }
     let env_keys = command_matches.get_many::<String>("keys");
-    let mut entries = decrypt_env_entries(&env_file).unwrap();
+    let mut entries = match decrypt_env_entries(&env_file) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("Failed to decrypt env file '{env_file}': {err}");
+            std::process::exit(1);
+        }
+    };
     let mut hint = format!(".env file({env_file})");
     if let Some(keys) = env_keys {
         let patterns: Vec<Pattern> = keys
@@ -70,9 +73,21 @@ pub fn decrypt_command(command_matches: &ArgMatches, profile: &Option<String>) {
         return;
     }
     let file_content = if is_remote_env {
-        read_content_from_dotenv_url(&env_file, None).unwrap()
+        match read_content_from_dotenv_url(&env_file, None) {
+            Ok(content) => content,
+            Err(err) => {
+                eprintln!("Failed to read env file from URL '{env_file}': {err}");
+                std::process::exit(1);
+            }
+        }
     } else {
-        fs::read_to_string(&env_file_path).unwrap()
+        match fs::read_to_string(&env_file_path) {
+            Ok(content) => content,
+            Err(err) => {
+                eprintln!("Failed to read env file '{env_file}': {err}");
+                std::process::exit(1);
+            }
+        }
     };
     let mut new_lines: Vec<String> = Vec::new();
     let mut is_changed = false;
@@ -102,7 +117,10 @@ pub fn decrypt_command(command_matches: &ArgMatches, profile: &Option<String>) {
         println!("{}", format!("✔ no changes ({env_file})").green());
     } else {
         let new_file_content = new_lines.join("\n");
-        fs::write(&env_file_path, new_file_content.as_bytes()).unwrap();
+        if let Err(err) = fs::write(&env_file_path, new_file_content.as_bytes()) {
+            eprintln!("Failed to write decrypted env file '{env_file}': {err}");
+            std::process::exit(1);
+        }
         println!("{}", format!("✔ {hint} decrypted ({env_file})").green());
     }
 }
@@ -112,37 +130,17 @@ pub fn decrypt_env_entries(
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
     let private_key = get_private_key_for_file(env_file)?;
     let mut entries: HashMap<String, String> = HashMap::new();
-    if env_file.ends_with(".properties") {
-        let f = File::open(env_file)?;
-        let reader = BufReader::new(f);
-        PropertiesIter::new(reader)
-            .read_into(|key, value| {
-                if value.starts_with("encrypted:") {
-                    let decrypted_text = decrypt_env_item(&private_key, &value).unwrap();
-                    entries.insert(key.clone(), decrypted_text);
-                } else {
-                    entries.insert(key.clone(), value.clone());
-                }
-            })
-            .unwrap();
+    let items = if env_file.starts_with("http://") || env_file.starts_with("https://") {
+        read_dotenv_url(env_file, None)?
     } else {
-        let items = if env_file.starts_with("http://") || env_file.starts_with("https://") {
-            read_dotenv_url(env_file, None)?
+        read_dotenv_file(env_file)?
+    };
+    for (key, value) in items {
+        if value.starts_with("encrypted:") {
+            let decrypted_text = decrypt_env_item(&private_key, &value)?;
+            entries.insert(key, decrypted_text);
         } else {
-            let mut entries: HashMap<String, String> = HashMap::new();
-            for item in dotenvy::from_filename_iter(env_file)? {
-                let (key, value) = &item.unwrap();
-                entries.insert(key.clone(), value.clone());
-            }
-            entries
-        };
-        for (key, value) in items {
-            if value.starts_with("encrypted:") {
-                let decrypted_text = decrypt_env_item(&private_key, &value)?;
-                entries.insert(key.clone(), decrypted_text);
-            } else {
-                entries.insert(key.clone(), value.clone());
-            }
+            entries.insert(key, value);
         }
     }
     Ok(entries)
@@ -213,10 +211,16 @@ fn decrypt_normal_text_file(text_file_path: &str) {
 
 #[cfg(test)]
 mod tests {
+    use crate::commands::crypt_util::{decrypt_env_item, encrypt_env_item};
+
     #[test]
     fn test_decrypt_dotenv() {
-        let entries = super::decrypt_env_entries(".env").unwrap();
-        println!("{entries:?}");
+        let kp = crate::commands::EcKeyPair::generate();
+        let public_key = kp.get_pk_hex();
+        let private_key = kp.get_sk_hex();
+        let encrypted = encrypt_env_item(&public_key, "World").unwrap();
+        let decrypted = decrypt_env_item(&private_key, &encrypted).unwrap();
+        assert_eq!(decrypted, "World");
     }
 
     #[test]

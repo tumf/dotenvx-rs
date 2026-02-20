@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_find_command_path() {
-        let path = find_command_path("lua");
+        let path = find_command_path("sh");
         println!("Found command path: {:?}", path);
         assert!(path.is_some());
     }
