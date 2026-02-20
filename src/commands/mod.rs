@@ -236,19 +236,50 @@ fn trim_private_key(private_key_hex: String) -> String {
 
 pub fn get_public_key_for_file(env_file: &str) -> Result<String, Box<dyn std::error::Error>> {
     let profile_name = get_profile_name_from_file(env_file);
-    if env_file.ends_with(".properties") {
-        let file_content = fs::read_to_string(env_file).unwrap();
-        for line in file_content.lines() {
-            if line.starts_with("dotenv.public.key") {
-                return line
-                    .split('=')
-                    .nth(1)
-                    .map(|s| s.trim().to_string())
-                    .ok_or_else(|| "Public key not found in properties file".into());
+
+    // 1) Prefer reading the explicitly passed env file.
+    if Path::new(env_file).exists() {
+        let entries = read_dotenv_file(env_file)?;
+
+        // Prefer profile-specific key derived from file name, then fallback to generic name.
+        let mut file_key_candidates = vec![get_public_key_name_for_file(env_file)];
+        if env_file.ends_with(".properties") {
+            file_key_candidates.push("dotenv.public.key".to_string());
+        } else {
+            file_key_candidates.push("DOTENV_PUBLIC_KEY".to_string());
+        }
+        file_key_candidates.dedup();
+
+        for key in file_key_candidates.iter() {
+            if let Some(val) = entries.get(key) {
+                return Ok(val.trim_matches('"').to_owned());
+            }
+        }
+
+        // As a last resort, accept any public key entry found in the file.
+        if let Some((_, val)) = entries.iter().find(|(k, _)| is_public_key_name(k)) {
+            return Ok(val.trim_matches('"').to_owned());
+        }
+    }
+
+    // 2) Then check environment variables (do not search other files in CWD).
+    let mut env_key_candidates = vec![
+        get_public_key_name(&profile_name),
+        "DOTENV_PUBLIC_KEY".to_string(),
+    ];
+    env_key_candidates.dedup();
+    for key in env_key_candidates.iter() {
+        if let Ok(public_key) = env::var(key) {
+            if !public_key.is_empty() {
+                return Ok(public_key);
             }
         }
     }
-    get_public_key(&profile_name)
+
+    // 3) Finally derive from the configured private key (may generate if missing).
+    let private_key_hex = get_private_key(&profile_name)?;
+    let kp = EcKeyPair::from_secret_key(&private_key_hex);
+    Ok(kp.get_pk_hex())
 }
 
 pub fn get_public_key(profile_name: &Option<String>) -> Result<String, Box<dyn std::error::Error>> {
